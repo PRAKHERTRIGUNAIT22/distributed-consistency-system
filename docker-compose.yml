@@ -1,0 +1,106 @@
+name: idempotent-gateway
+
+x-app-env: &app-env
+  DATABASE_URL: postgres://gateway:gateway_pw@postgres:5432/gateway
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  LOCK_TTL_SECONDS: "30"
+  KEY_TTL_HOURS: "24"
+  STUCK_AFTER_SECONDS: "120"
+  BANK_LATENCY_MS: "200"
+
+x-app: &app
+  build: ./app
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks: [gateway-net]
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: gateway-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway_pw
+    command:
+      - "postgres"
+      - "-c"
+      - "synchronous_commit=on"       
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "idle_in_transaction_session_timeout=30000"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [gateway-net]
+
+  redis:
+    image: redis:7-alpine
+    container_name: gateway-redis
+    restart: unless-stopped
+    # Redis is only a lock/cache layer. Losing it must never cause a double charge.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [gateway-net]
+
+  app1:
+    <<: *app
+    container_name: gateway-app1
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app1
+
+  app2:
+    <<: *app
+    container_name: gateway-app2
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app2
+
+  app3:
+    <<: *app
+    container_name: gateway-app3
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app3
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: gateway-nginx
+    restart: unless-stopped
+    depends_on: [app1, app2, app3]
+    ports:
+      - "8080:80"      # load test hits http://localhost:8080
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks: [gateway-net]
+
+networks:
+  gateway-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
